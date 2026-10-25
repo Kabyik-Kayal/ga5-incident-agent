@@ -63,8 +63,10 @@ def extract_case_arguments(schema: Dict[str, Any], service: str, evidence_text: 
             m = re.search(r'\b(feat_[a-zA-Z0-9_\-]+|flag_[a-zA-Z0-9_\-]+|[a-z_]+_toggle|[a-z_]+_feature)\b', evidence_text, re.IGNORECASE)
             args[prop] = m.group(1) if m else "new_checkout_flow"
         elif "pool" in prop_lower or "db" in prop_lower or "database" in prop_lower:
-            m = re.search(r'\b([a-zA-Z0-9_\-]+_pool|[a-zA-Z0-9_\-]+_db|primary|replica)\b', evidence_text, re.IGNORECASE)
-            args[prop] = m.group(1) if m else f"{service}_db"
+            m = re.search(r'\b([a-zA-Z0-9_\-]+[-_](?:db|pool|database|postgres|mysql)|primary|replica)\b', evidence_text, re.IGNORECASE)
+            if not m:
+                m = re.search(r'(?:on|database|db|pool)\s+([a-zA-Z0-9_\-]+)', evidence_text, re.IGNORECASE)
+            args[prop] = m.group(1) if m else f"{service}-db"
         elif "metric" in prop_lower:
             m = re.search(r'\b(cpu_utilization|memory_usage|http_5xx_rate|latency_p99|pool_exhaustion)\b', text_lower)
             args[prop] = m.group(1) if m else "cpu_utilization"
@@ -110,11 +112,11 @@ async def plan_incident(
 
     # 1. Try Gemini API directly if GEMINI_API_KEY is present
     if gemini_key and httpx:
-        configured_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-        candidates = [configured_model]
-        for fallback in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-            if fallback not in candidates:
-                candidates.append(fallback)
+        configured_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        # gemini-2.5-flash is active on Google AI Studio
+        candidates = ["gemini-2.5-flash"]
+        if configured_model not in candidates:
+            candidates.append(configured_model)
 
         system_instruction = f"""You are an incident response expert.
 Incident Title: {title}
@@ -128,7 +130,7 @@ Evidence Logs:
 
 RULES:
 1. Choose exactly ONE root cause strictly from Allowed Root Causes.
-2. Select 2 to 4 evidence IDs from the Evidence Logs that directly prove this root cause.
+2. Select 2 to 4 evidence IDs from the Evidence Logs that directly prove this root cause (prefer evidence lines like [ev_...] or [sig_...], NOT chat chatter).
 3. Choose 1 or 2 diagnostic tools from Available Diagnostic Tools needed to confirm it.
 4. For each diagnostic tool, provide exact arguments matching its inputSchema derived from the evidence lines.
 5. Every diagnostic tool must cite 1 or 2 evidence IDs from your 2-4 selected evidence IDs.
@@ -147,7 +149,7 @@ RULES:
         for candidate_model in candidates:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={gemini_key}"
             try:
-                async with httpx.AsyncClient(timeout=4.0) as client:
+                async with httpx.AsyncClient(timeout=8.0) as client:
                     res = await client.post(url, json=payload)
                     if res.status_code == 200:
                         result = res.json()
@@ -226,7 +228,11 @@ RULES:
     for item in evidence_items:
         item_text_lower = item["full"].lower()
         match_count = sum(1 for kw in cause_keywords if kw in item_text_lower)
-        scored_evidence.append((match_count, item["id"], item["text"]))
+        # Prioritize true evidence tags over chat/conversational logs
+        prefix_score = 5 if re.match(r'^(ev|sig|metric|err|alert|diag|log)', item["id"], re.I) else 0
+        if re.match(r'^(chat|msg|user|info)', item["id"], re.I):
+            prefix_score -= 10
+        scored_evidence.append((match_count + prefix_score, item["id"], item["text"]))
 
     scored_evidence.sort(key=lambda x: x[0], reverse=True)
     chosen_evidence_ids = [x[1] for x in scored_evidence[:max(2, min(4, len(scored_evidence)))]]
@@ -258,20 +264,34 @@ RULES:
             "evidence": assigned_ev
         })
 
-    # Plan intended effect
+    # Plan intended effect strictly matching the diagnosed root cause
+    cause_lower = best_cause.lower()
     at_scaling_limit = any(term in evidence_text_combined for term in [
         "scaling limit", "max replica", "limit reached", "cannot scale", "max capacity", "quota exceeded"
     ])
 
-    effect_tool_name = "scale_service"
     if at_scaling_limit and "page_owner" in effect_tools:
         effect_tool_name = "page_owner"
-    elif "rollback_deployment" in effect_tools and any(w in evidence_text_combined for w in ["regression", "deploy", "canary", "v2."]):
-        effect_tool_name = "rollback_deployment"
-    elif "disable_feature" in effect_tools and any(w in evidence_text_combined for w in ["flag", "toggle", "feature"]):
-        effect_tool_name = "disable_feature"
-    elif effect_tools:
-        effect_tool_name = effect_tools[0]
+    elif any(term in cause_lower for term in ["deploy", "regression", "release", "canary", "version", "build"]):
+        if "rollback_deployment" in effect_tools:
+            effect_tool_name = "rollback_deployment"
+        else:
+            effect_tool_name = effect_tools[0] if effect_tools else "rollback_deployment"
+    elif any(term in cause_lower for term in ["feature", "flag", "toggle"]):
+        if "disable_feature" in effect_tools:
+            effect_tool_name = "disable_feature"
+        else:
+            effect_tool_name = effect_tools[0] if effect_tools else "disable_feature"
+    else:
+        # Load, traffic, CPU, memory, connection pool saturation -> scale_service (or page_owner if limit reached)
+        if "scale_service" in effect_tools:
+            effect_tool_name = "scale_service"
+        elif "page_owner" in effect_tools:
+            effect_tool_name = "page_owner"
+        elif effect_tools:
+            effect_tool_name = effect_tools[0]
+        else:
+            effect_tool_name = "scale_service"
 
     eff_spec = next((t for t in effect_tool_catalog if t["name"] == effect_tool_name), {})
     eff_schema = eff_spec.get("inputSchema", {})

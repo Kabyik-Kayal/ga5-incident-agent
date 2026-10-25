@@ -40,25 +40,24 @@ async def health_check():
         }
     }
 
-@app.get("/debug/test-ai")
-async def debug_test_ai():
+@app.post("/debug/test-planner")
+async def debug_test_planner(request: Request):
     import time
-    import httpx
-    key = os.getenv("GEMINI_API_KEY")
-    results = {}
-    if not key:
-        return {"error": "GEMINI_API_KEY not set"}
-    for m in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-3.8-flash"]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
-        payload = {"contents": [{"parts": [{"text": "ping"}]}]}
-        t0 = time.time()
-        try:
-            async with httpx.AsyncClient(timeout=4.0) as client:
-                res = await client.post(url, json=payload)
-                results[m] = {"status": res.status_code, "time_sec": round(time.time() - t0, 3), "snippet": res.text[:100]}
-        except Exception as e:
-            results[m] = {"error": str(e), "time_sec": round(time.time() - t0, 3)}
-    return results
+    body = await request.json()
+    incident_info = body.get("incident", {})
+    policy = body.get("policy", {})
+    tool_catalog = body.get("toolCatalog", [])
+    t0 = time.time()
+    plan = await plan_incident(
+        service=incident_info.get("service", "core-api"),
+        title=incident_info.get("title", "Incident Outage"),
+        transcript=incident_info.get("transcript", ""),
+        allowed_causes=incident_info.get("allowedRootCauses", []),
+        tool_catalog=tool_catalog,
+        effect_tools=policy.get("effectTools", [])
+    )
+    elapsed = round(time.time() - t0, 3)
+    return {"elapsed_seconds": elapsed, "plan": plan}
 
 @app.post("/v2/incidents")
 async def handle_incident(request: Request):
