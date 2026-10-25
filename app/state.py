@@ -218,6 +218,7 @@ class StateStore:
                     run["pendingApproval"] = None
 
                     resp = {
+                        "runId": run_id,
                         "status": "waiting",
                         "dispatches": [effect_disp],
                         "approvals": []
@@ -287,6 +288,7 @@ class StateStore:
             # If retrying a 503, return immediately with the retry dispatch
             if has_503_retry:
                 resp = {
+                    "runId": run_id,
                     "status": "waiting",
                     "dispatches": retry_dispatches,
                     "approvals": []
@@ -311,6 +313,7 @@ class StateStore:
         # If any diagnostic is still in progress, stay in waiting
         if not all_diags_resolved:
             resp = {
+                "runId": run_id,
                 "status": "waiting",
                 "dispatches": [],
                 "approvals": []
@@ -399,6 +402,7 @@ class StateStore:
                 }
 
                 resp = {
+                    "runId": run_id,
                     "status": "waiting",
                     "dispatches": [],
                     "approvals": [approval_req_obj]
@@ -439,6 +443,7 @@ class StateStore:
                 }
 
                 resp = {
+                    "runId": run_id,
                     "status": "waiting",
                     "dispatches": [effect_disp],
                     "approvals": []
@@ -451,6 +456,7 @@ class StateStore:
         effect_resolved = all(action_resolved(m) for m in effect_actions)
         if not effect_resolved:
             resp = {
+                "runId": run_id,
                 "status": "waiting",
                 "dispatches": [],
                 "approvals": []
