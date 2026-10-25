@@ -36,9 +36,29 @@ async def health_check():
             "provider": active_provider,
             "gemini_configured": gemini_configured,
             "openai_configured": openai_configured,
-            "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+            "model": os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         }
     }
+
+@app.get("/debug/test-ai")
+async def debug_test_ai():
+    import time
+    import httpx
+    key = os.getenv("GEMINI_API_KEY")
+    results = {}
+    if not key:
+        return {"error": "GEMINI_API_KEY not set"}
+    for m in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-3.8-flash"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
+        payload = {"contents": [{"parts": [{"text": "ping"}]}]}
+        t0 = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                res = await client.post(url, json=payload)
+                results[m] = {"status": res.status_code, "time_sec": round(time.time() - t0, 3), "snippet": res.text[:100]}
+        except Exception as e:
+            results[m] = {"error": str(e), "time_sec": round(time.time() - t0, 3)}
+    return results
 
 @app.post("/v2/incidents")
 async def handle_incident(request: Request):

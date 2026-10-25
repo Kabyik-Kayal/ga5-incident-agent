@@ -147,7 +147,7 @@ RULES:
         for candidate_model in candidates:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={gemini_key}"
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
+                async with httpx.AsyncClient(timeout=4.0) as client:
                     res = await client.post(url, json=payload)
                     if res.status_code == 200:
                         result = res.json()
