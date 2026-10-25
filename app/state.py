@@ -1,7 +1,14 @@
 import hashlib
 import json
 from typing import Any, Dict, List, Optional, Tuple
-from fastapi import HTTPException
+try:
+    from fastapi import HTTPException
+except ImportError:
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str = ""):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
 
 from app.telemetry import (
     gen_trace_id,
@@ -23,6 +30,7 @@ class StateStore:
         raw_body: bytes,
         body_dict: Dict[str, Any],
         incoming_traceparent: Optional[str],
+        incoming_tracestate: Optional[str],
         plan: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], int]:
         run_id = body_dict["runId"]
@@ -77,6 +85,9 @@ class StateStore:
                 "attempt": 1,
                 "traceparent": tp
             }
+            if incoming_tracestate:
+                disp["tracestate"] = incoming_tracestate
+
             dispatches.append(disp)
 
             logical_actions[act_id] = {
@@ -85,6 +96,7 @@ class StateStore:
                 "toolName": diag["toolName"],
                 "phase": "diagnostic",
                 "arguments": diag["arguments"],
+                "evidence": diag["evidence"],
                 "execSpanId": exec_span_id,
                 "attempts": [{
                     "attempt": 1,
@@ -107,13 +119,15 @@ class StateStore:
             "runId": run_id,
             "bodyHash": body_hash,
             "traceId": trace_id,
+            "tracestate": incoming_tracestate or "",
             "parentTraceSpanId": parent_span_id,
             "serverSpanId": server_span_id,
             "agentSpanId": agent_span_id,
             "chatSpanId": chat_span_id,
             "publicMarker": public_marker,
-            "modelName": plan.get("modelName", "incident-agent-planner"),
+            "modelName": plan.get("modelName", "gemini-2.0-flash"),
             "diagnosis": initial_response["diagnosis"],
+            "intendedEffect": plan.get("intendedEffect", {}),
             "policy": policy,
             "toolCatalog": body_dict.get("toolCatalog", []),
             "incident": incident_info,
@@ -156,8 +170,7 @@ class StateStore:
                 )
 
         trace_id = run["traceId"]
-        next_dispatches: List[Dict[str, Any]] = []
-        next_approvals: List[Dict[str, Any]] = []
+        tracestate = run.get("tracestate", "")
 
         # 1. Process Approvals Receipt
         if "approvals" in receipt_dict and receipt_dict["approvals"]:
@@ -194,19 +207,29 @@ class StateStore:
                         "attempt": 1,
                         "traceparent": format_traceparent(trace_id, client_span_id)
                     }
-                    next_dispatches.append(effect_disp)
-                    run["actionLog"].append(effect_disp)
+                    if tracestate:
+                        effect_disp["tracestate"] = tracestate
 
+                    run["actionLog"].append(effect_disp)
                     run["logicalActions"][act_id]["attempts"].append({
                         "attempt": 1,
                         "clientSpanId": client_span_id
                     })
                     run["pendingApproval"] = None
 
+                    resp = {
+                        "status": "waiting",
+                        "dispatches": [effect_disp],
+                        "approvals": []
+                    }
+                    run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": resp}
+                    run["currentState"] = resp
+                    return resp
+
         # 2. Process Outcomes Receipt
         if "outcomes" in receipt_dict and receipt_dict["outcomes"]:
             has_503_retry = False
-            has_timeout = False
+            retry_dispatches: List[Dict[str, Any]] = []
 
             for outcome in receipt_dict["outcomes"]:
                 act_id = outcome.get("actionId")
@@ -251,171 +274,204 @@ class StateStore:
                         }
                         if act_meta.get("evidence"):
                             retry_disp["evidence"] = act_meta["evidence"]
+                        if tracestate:
+                            retry_disp["tracestate"] = tracestate
 
-                        next_dispatches.append(retry_disp)
+                        retry_dispatches.append(retry_disp)
                         run["actionLog"].append(retry_disp)
                         act_meta["attempts"].append({
                             "attempt": 2,
                             "clientSpanId": new_client_span_id
                         })
 
-                if stat == 0 or err_type == "timeout":
-                    has_timeout = True
-
             # If retrying a 503, return immediately with the retry dispatch
             if has_503_retry:
                 resp = {
                     "status": "waiting",
-                    "dispatches": next_dispatches,
+                    "dispatches": retry_dispatches,
                     "approvals": []
                 }
                 run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": resp}
                 run["currentState"] = resp
                 return resp
 
-            # Check if diagnostics completed and an effect is needed
-            diags_succeeded = all(
-                any(att.get("status") == 200 for att in meta["attempts"])
-                for meta in run["logicalActions"].values()
-                if meta["phase"] == "diagnostic"
-            )
-            effects_dispatched = any(meta["phase"] == "effect" for meta in run["logicalActions"].values())
+        # 3. Check State Transitions
+        diag_actions = [m for m in run["logicalActions"].values() if m["phase"] == "diagnostic"]
+        effect_actions = [m for m in run["logicalActions"].values() if m["phase"] == "effect"]
 
-            # Only emit effect if diagnostics succeeded and no timeout occurred
-            if diags_succeeded and not effects_dispatched and not has_timeout:
-                policy = run["policy"]
-                effect_tools = policy.get("effectTools", ["scale_service"])
-                approval_req = policy.get("approvalRequiredFor", [])
-                transcript_txt = run["incident"].get("transcript", "").lower()
+        # Has each diagnostic finished?
+        def action_resolved(meta):
+            for att in meta["attempts"]:
+                if att.get("status") == 200 or att.get("errorType") == "timeout" or att.get("status") == 0:
+                    return True
+            return False
 
-                # "When a service is already at its permitted scaling limit, page the owner instead of scaling."
-                at_scaling_limit = any(term in transcript_txt for term in [
-                    "scaling limit", "max replica", "limit reached", "cannot scale", "max capacity"
-                ])
+        all_diags_resolved = all(action_resolved(m) for m in diag_actions)
 
-                chosen_tool = "scale_service"
-                if at_scaling_limit and "page_owner" in effect_tools:
-                    chosen_tool = "page_owner"
-                elif "rollback_deployment" in effect_tools and any(w in transcript_txt for w in ["regression", "deployment", "canary"]):
-                    chosen_tool = "rollback_deployment"
-                elif "disable_feature" in effect_tools and any(w in transcript_txt for w in ["feature_flag", "feature flag", "bad toggle"]):
-                    chosen_tool = "disable_feature"
-                else:
-                    chosen_tool = effect_tools[0] if effect_tools else "scale_service"
-
-                run["chosenEffect"] = chosen_tool
-                effect_args = {"service": run["incident"].get("service", "core-api")}
-
-                # Check if approval required
-                if chosen_tool in approval_req:
-                    app_id = "app_" + gen_span_id()[:10]
-                    act_id = "act_" + gen_span_id()[:10]
-                    call_id = "call_" + gen_span_id()[:10]
-
-                    args_digest = compute_arguments_digest(effect_args)
-                    next_approvals.append({
-                        "approvalId": app_id,
-                        "actionId": act_id,
-                        "toolName": chosen_tool,
-                        "argumentsDigest": args_digest
-                    })
-
-                    run["pendingApproval"] = {
-                        "approvalId": app_id,
-                        "actionId": act_id,
-                        "callId": call_id,
-                        "toolName": chosen_tool,
-                        "arguments": effect_args
-                    }
-
-                    run["logicalActions"][act_id] = {
-                        "actionId": act_id,
-                        "callId": call_id,
-                        "toolName": chosen_tool,
-                        "phase": "effect",
-                        "arguments": effect_args,
-                        "execSpanId": gen_span_id(),
-                        "attempts": []
-                    }
-
-                    resp = {
-                        "status": "waiting",
-                        "dispatches": [],
-                        "approvals": next_approvals
-                    }
-                    run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": resp}
-                    run["currentState"] = resp
-                    return resp
-                else:
-                    # Safe effect without approval gate
-                    act_id = "act_" + gen_span_id()[:10]
-                    call_id = "call_" + gen_span_id()[:10]
-                    client_span_id = gen_span_id()
-
-                    effect_disp = {
-                        "actionId": act_id,
-                        "callId": call_id,
-                        "phase": "effect",
-                        "toolName": chosen_tool,
-                        "arguments": effect_args,
-                        "attempt": 1,
-                        "traceparent": format_traceparent(trace_id, client_span_id)
-                    }
-                    next_dispatches.append(effect_disp)
-                    run["actionLog"].append(effect_disp)
-
-                    run["logicalActions"][act_id] = {
-                        "actionId": act_id,
-                        "callId": call_id,
-                        "toolName": chosen_tool,
-                        "phase": "effect",
-                        "arguments": effect_args,
-                        "execSpanId": gen_span_id(),
-                        "attempts": [{
-                            "attempt": 1,
-                            "clientSpanId": client_span_id
-                        }]
-                    }
-
-                    resp = {
-                        "status": "waiting",
-                        "dispatches": next_dispatches,
-                        "approvals": []
-                    }
-                    run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": resp}
-                    run["currentState"] = resp
-                    return resp
-
-        # Return waiting if new dispatches or approvals exist
-        if next_dispatches or next_approvals:
+        # If any diagnostic is still in progress, stay in waiting
+        if not all_diags_resolved:
             resp = {
                 "status": "waiting",
-                "dispatches": next_dispatches,
-                "approvals": next_approvals
+                "dispatches": [],
+                "approvals": []
             }
             run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": resp}
             run["currentState"] = resp
             return resp
 
-        # Terminal state determination
-        has_timeout_error = any(
+        # Did any diagnostic timeout?
+        has_timeout = any(
             att.get("errorType") == "timeout" or att.get("status") == 0
-            for meta in run["logicalActions"].values()
+            for meta in diag_actions
             for att in meta["attempts"]
         )
 
+        if has_timeout:
+            # "A status:0,errorType:'timeout' fails the diagnostic, so do not send its dependent effect."
+            suppressed_effect = run["intendedEffect"].get("toolName", "scale_service") if run.get("intendedEffect") else "scale_service"
+            final_resp = {
+                "runId": run_id,
+                "status": "failed",
+                "diagnosis": run["diagnosis"],
+                "chosenEffect": None,
+                "suppressed": [suppressed_effect],
+                "actionLog": run["actionLog"],
+                "receiptLog": run["receiptLog"],
+                "otlp": build_otlp_payload(run)
+            }
+            run["status"] = "failed"
+            run["currentState"] = final_resp
+            run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": final_resp}
+            return final_resp
+
+        # All diagnostics succeeded! Check if effect has been dispatched yet
+        if not effect_actions:
+            # Plan or retrieve effect
+            policy = run["policy"]
+            effect_tools = policy.get("effectTools", ["scale_service"])
+            approval_req = policy.get("approvalRequiredFor", [])
+            
+            planned_eff = run.get("intendedEffect", {})
+            chosen_tool = planned_eff.get("toolName") or (effect_tools[0] if effect_tools else "scale_service")
+            chosen_args = planned_eff.get("arguments") or {"service": run["incident"].get("service", "core-api")}
+
+            # Scaling limit verification
+            transcript_txt = run["incident"].get("transcript", "").lower()
+            at_scaling_limit = any(term in transcript_txt for term in [
+                "scaling limit", "max replica", "limit reached", "cannot scale", "max capacity"
+            ])
+            if at_scaling_limit and "page_owner" in effect_tools:
+                chosen_tool = "page_owner"
+                chosen_args = {"service": run["incident"].get("service", "core-api"), "reason": "scaling_limit_reached"}
+
+            run["chosenEffect"] = chosen_tool
+
+            # Check if approval required
+            if chosen_tool in approval_req:
+                app_id = "app_" + gen_span_id()[:10]
+                act_id = "act_" + gen_span_id()[:10]
+                call_id = "call_" + gen_span_id()[:10]
+
+                args_digest = compute_arguments_digest(chosen_args)
+                approval_req_obj = {
+                    "approvalId": app_id,
+                    "actionId": act_id,
+                    "toolName": chosen_tool,
+                    "argumentsDigest": args_digest
+                }
+
+                run["pendingApproval"] = {
+                    "approvalId": app_id,
+                    "actionId": act_id,
+                    "callId": call_id,
+                    "toolName": chosen_tool,
+                    "arguments": chosen_args
+                }
+
+                run["logicalActions"][act_id] = {
+                    "actionId": act_id,
+                    "callId": call_id,
+                    "toolName": chosen_tool,
+                    "phase": "effect",
+                    "arguments": chosen_args,
+                    "execSpanId": gen_span_id(),
+                    "attempts": []
+                }
+
+                resp = {
+                    "status": "waiting",
+                    "dispatches": [],
+                    "approvals": [approval_req_obj]
+                }
+                run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": resp}
+                run["currentState"] = resp
+                return resp
+            else:
+                # Safe effect without approval
+                act_id = "act_" + gen_span_id()[:10]
+                call_id = "call_" + gen_span_id()[:10]
+                client_span_id = gen_span_id()
+
+                effect_disp = {
+                    "actionId": act_id,
+                    "callId": call_id,
+                    "phase": "effect",
+                    "toolName": chosen_tool,
+                    "arguments": chosen_args,
+                    "attempt": 1,
+                    "traceparent": format_traceparent(trace_id, client_span_id)
+                }
+                if tracestate:
+                    effect_disp["tracestate"] = tracestate
+
+                run["actionLog"].append(effect_disp)
+                run["logicalActions"][act_id] = {
+                    "actionId": act_id,
+                    "callId": call_id,
+                    "toolName": chosen_tool,
+                    "phase": "effect",
+                    "arguments": chosen_args,
+                    "execSpanId": gen_span_id(),
+                    "attempts": [{
+                        "attempt": 1,
+                        "clientSpanId": client_span_id
+                    }]
+                }
+
+                resp = {
+                    "status": "waiting",
+                    "dispatches": [effect_disp],
+                    "approvals": []
+                }
+                run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": resp}
+                run["currentState"] = resp
+                return resp
+
+        # Effect was already dispatched; check if effect action has resolved
+        effect_resolved = all(action_resolved(m) for m in effect_actions)
+        if not effect_resolved:
+            resp = {
+                "status": "waiting",
+                "dispatches": [],
+                "approvals": []
+            }
+            run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": resp}
+            run["currentState"] = resp
+            return resp
+
+        # Terminal completed state!
         final_resp = {
             "runId": run_id,
-            "status": "failed" if has_timeout_error else "completed",
+            "status": "completed",
             "diagnosis": run["diagnosis"],
-            "chosenEffect": run.get("chosenEffect") or "none",
+            "chosenEffect": run.get("chosenEffect", "scale_service"),
             "suppressed": [],
             "actionLog": run["actionLog"],
             "receiptLog": run["receiptLog"],
             "otlp": build_otlp_payload(run)
         }
 
-        run["status"] = final_resp["status"]
+        run["status"] = "completed"
         run["currentState"] = final_resp
         run["receiptResponses"][receipt_id] = {"hash": body_hash, "response": final_resp}
         return final_resp

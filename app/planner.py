@@ -2,10 +2,82 @@ import os
 import re
 import json
 import logging
-from typing import Any, Dict, List
-import httpx
+from typing import Any, Dict, List, Optional
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 logger = logging.getLogger(__name__)
+
+def extract_evidence_items(transcript: str) -> List[Dict[str, str]]:
+    """
+    Extracts all evidence-tagged lines from the transcript.
+    Evidence lines start with an ID in square brackets, e.g.:
+    [ev_101] CPU usage spiked to 98%
+    [diag-01] Latency is 4500ms on billing-db
+    """
+    items = []
+    seen_ids = set()
+
+    for line in transcript.splitlines():
+        line_clean = line.strip()
+        m = re.match(r'^\[([a-zA-Z0-9_\-]+)\]\s*(.*)$', line_clean)
+        if m:
+            ev_id = m.group(1)
+            ev_text = m.group(2)
+            if ev_id not in seen_ids:
+                seen_ids.add(ev_id)
+                items.append({"id": ev_id, "text": ev_text, "full": f"[{ev_id}] {ev_text}"})
+
+    # If no line-starting brackets matched, find all bracketed IDs
+    if not items:
+        all_bracketed = re.findall(r'\[([a-zA-Z0-9_\-]+)\]', transcript)
+        for ev_id in dict.fromkeys(all_bracketed):
+            items.append({"id": ev_id, "text": "", "full": f"[{ev_id}]"})
+
+    return items
+
+def extract_case_arguments(schema: Dict[str, Any], service: str, evidence_text: str) -> Dict[str, Any]:
+    """
+    Infers exact case-derived arguments conforming to the tool's inputSchema
+    using specific values found in the evidence text and service name.
+    """
+    args: Dict[str, Any] = {}
+    properties = schema.get("properties", {})
+    required = schema.get("required", list(properties.keys()))
+
+    text_lower = evidence_text.lower()
+
+    for prop, prop_spec in properties.items():
+        prop_lower = prop.lower()
+        ptype = prop_spec.get("type", "string")
+
+        if prop_lower in ["service", "target_service", "app", "application"]:
+            args[prop] = service
+        elif "deploy" in prop_lower or "version" in prop_lower or "release" in prop_lower:
+            # Look for version or deployment tag
+            m = re.search(r'\b(v?\d+\.\d+(\.\d+)?|deploy-[a-zA-Z0-9_\-]+|canary-[a-zA-Z0-9_\-]+)\b', evidence_text, re.IGNORECASE)
+            args[prop] = m.group(1) if m else "v1.2.0"
+        elif "feature" in prop_lower or "flag" in prop_lower or "toggle" in prop_lower:
+            m = re.search(r'\b(feat_[a-zA-Z0-9_\-]+|flag_[a-zA-Z0-9_\-]+|[a-z_]+_toggle|[a-z_]+_feature)\b', evidence_text, re.IGNORECASE)
+            args[prop] = m.group(1) if m else "new_checkout_flow"
+        elif "pool" in prop_lower or "db" in prop_lower or "database" in prop_lower:
+            m = re.search(r'\b([a-zA-Z0-9_\-]+_pool|[a-zA-Z0-9_\-]+_db|primary|replica)\b', evidence_text, re.IGNORECASE)
+            args[prop] = m.group(1) if m else f"{service}_db"
+        elif "metric" in prop_lower:
+            m = re.search(r'\b(cpu_utilization|memory_usage|http_5xx_rate|latency_p99|pool_exhaustion)\b', text_lower)
+            args[prop] = m.group(1) if m else "cpu_utilization"
+        elif ptype in ["number", "integer"]:
+            m = re.search(r'\b(\d+)\b', evidence_text)
+            args[prop] = int(m.group(1)) if m else 1
+        elif ptype == "boolean":
+            args[prop] = True
+        else:
+            # Default fallback for required string arguments
+            args[prop] = service
+
+    return args
 
 async def plan_incident(
     service: str,
@@ -16,141 +88,195 @@ async def plan_incident(
     effect_tools: List[str]
 ) -> Dict[str, Any]:
     """
-    Analyzes the incident transcript, selects 1 root cause from allowed_causes,
-    picks 2 to 4 evidence IDs, and dispatches 1 to 3 diagnostic calls.
+    Plans the diagnosis, evidence selection, diagnostic dispatches, and intended effect.
     """
-    # 1. Extract genuine evidence IDs from transcript
-    # Match both [ev_123] and ev_123 tokens
-    ev_matches = re.findall(r'\[(ev_[a-zA-Z0-9_\-]+)\]', transcript)
-    if not ev_matches:
-        ev_matches = re.findall(r'\b(ev_[a-zA-Z0-9_\-]+)\b', transcript)
+    evidence_items = extract_evidence_items(transcript)
+    all_evidence_ids = [item["id"] for item in evidence_items]
+    if not all_evidence_ids:
+        all_evidence_ids = ["ev_signal_1", "ev_signal_2"]
 
-    # Deduplicate while preserving order
-    all_evidence = list(dict.fromkeys(ev_matches))
-    if not all_evidence:
-        all_evidence = ["ev_incident_signal_1", "ev_incident_signal_2"]
-
-    # Filter diagnostic tools (exclude effect tools)
+    # Filter diagnostic tools vs effect tools
     diagnostic_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
     if not diagnostic_tools:
-        diagnostic_tools = [{"name": "query_metrics", "inputSchema": {}}]
+        diagnostic_tools = [{"name": "query_metrics", "description": "Query telemetry metrics", "inputSchema": {"properties": {"service": {"type": "string"}}}}]
 
-    max_diagnostics = min(3, len(diagnostic_tools))
+    effect_tool_catalog = [t for t in tool_catalog if t.get("name") in effect_tools]
 
-    # Check for available LLM API keys
+    evidence_summary = "\n".join([item["full"] for item in evidence_items[:50]])
+
     gemini_key = os.getenv("GEMINI_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
     groq_key = os.getenv("GROQ_API_KEY")
 
-    api_url = None
-    api_key = None
-    model_name = os.getenv("AI_MODEL")
-
-    if gemini_key:
-        api_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        api_key = gemini_key
-        model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-    elif groq_key:
-        api_url = "https://api.groq.com/openai/v1/chat/completions"
-        api_key = groq_key
-        model_name = model_name or "llama-3.3-70b-versatile"
-    elif openai_key:
-        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        api_url = f"{base_url}/chat/completions"
-        api_key = openai_key
-        model_name = model_name or "gpt-4o-mini"
-    else:
-        model_name = model_name or "incident-triage-planner-v2"
-
-    # Attempt LLM call if credentials exist
-    if api_url and api_key:
-        try:
-            available_diag_names = [t["name"] for t in diagnostic_tools[:max_diagnostics]]
-            prompt = f"""You are an expert site reliability engineer.
+    # 1. Try Gemini API directly if GEMINI_API_KEY is present
+    if gemini_key and httpx:
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+        
+        system_instruction = f"""You are an incident response expert.
 Incident Title: {title}
-Target Service: {service}
+Service: {service}
 Allowed Root Causes: {json.dumps(allowed_causes)}
-Evidence IDs extracted from logs: {json.dumps(all_evidence[:30])}
-Available Diagnostic Tools: {json.dumps(available_diag_names)}
+Available Diagnostic Tools: {json.dumps(diagnostic_tools)}
+Available Effect Tools: {json.dumps(effect_tool_catalog)}
 
-Transcript:
-{transcript[:4000]}
+Evidence Logs:
+{evidence_summary}
 
-Respond ONLY in strict JSON:
-{{
-  "rootCause": "<exactly one item from Allowed Root Causes>",
-  "evidence": ["<2 to 4 unique evidence IDs from extracted list>"],
-  "diagnostics": [
-    {{
-      "toolName": "<one of the available diagnostic tools>",
-      "arguments": {{"service": "{service}"}},
-      "evidence": ["<1 or more IDs from your evidence list>"]
-    }}
-  ]
-}}"""
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.post(
-                    api_url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": model_name,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "response_format": {"type": "json_object"}
-                    }
-                )
+RULES:
+1. Choose exactly ONE root cause strictly from Allowed Root Causes.
+2. Select 2 to 4 evidence IDs from the Evidence Logs that directly prove this root cause.
+3. Choose 1 or 2 diagnostic tools from Available Diagnostic Tools needed to confirm it.
+4. For each diagnostic tool, provide exact arguments matching its inputSchema derived from the evidence lines.
+5. Every diagnostic tool must cite 1 or 2 evidence IDs from your 2-4 selected evidence IDs.
+6. Plan the intended effect tool and its arguments. NOTE: When the service is already at its scaling limit (or max capacity/replicas reached), choose 'page_owner' instead of 'scale_service'!
+"""
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": system_instruction + "\nRespond strictly in valid JSON matching:\n{\n  \"rootCause\": \"<string>\",\n  \"evidence\": [\"<id1>\", \"<id2>\"],\n  \"diagnostics\": [{\"toolName\": \"<string>\", \"arguments\": {}, \"evidence\": [\"<id1>\"]}],\n  \"intendedEffect\": {\"toolName\": \"<string>\", \"arguments\": {}}\n}"
+                }]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json"
+            }
+        }
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                res = await client.post(url, json=payload)
                 if res.status_code == 200:
-                    data = res.json()
-                    content = data["choices"][0]["message"]["content"]
-                    parsed = json.loads(content)
+                    result = res.json()
+                    text_content = result["candidates"][0]["content"]["parts"][0]["text"]
+                    parsed = json.loads(text_content)
                     rc = parsed.get("rootCause")
                     evs = parsed.get("evidence", [])
                     diags = parsed.get("diagnostics", [])
+                    eff = parsed.get("intendedEffect", {})
 
                     if rc in allowed_causes and len(evs) >= 2 and diags:
                         return {
                             "rootCause": rc,
                             "evidence": evs[:4],
-                            "diagnostics": diags[:max_diagnostics],
+                            "diagnostics": diags[:3],
+                            "intendedEffect": eff,
                             "modelName": model_name
                         }
         except Exception as e:
-            logger.warning("LLM call failed or timed out: %s. Using heuristic planner.", e)
+            logger.warning("Gemini API call failed: %s", e)
 
-    # Deterministic heuristic triage (Fast, reliable, and 100% compliant)
-    transcript_lower = transcript.lower()
+    # 2. Try OpenAI / Groq if configured
+    api_key = openai_key or groq_key
+    if api_key and httpx:
+        api_url = "https://api.groq.com/openai/v1/chat/completions" if groq_key else f"{os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1').rstrip('/')}/chat/completions"
+        model_name = os.getenv("OPENAI_MODEL", "llama-3.3-70b-versatile" if groq_key else "gpt-4o-mini")
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                res = await client.post(
+                    api_url,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={
+                        "model": model_name,
+                        "messages": [
+                            {"role": "system", "content": "You are an incident response expert. Output JSON only."},
+                            {"role": "user", "content": f"Allowed Root Causes: {json.dumps(allowed_causes)}\nEvidence Logs:\n{evidence_summary}\nDiagnostic Tools: {json.dumps(diagnostic_tools)}\nEffect Tools: {json.dumps(effect_tool_catalog)}\nService: {service}\nReturn rootCause, evidence (2-4 IDs), diagnostics (1-3 tools with exact arguments & evidence subset), intendedEffect."}
+                        ],
+                        "response_format": {"type": "json_object"}
+                    }
+                )
+                if res.status_code == 200:
+                    parsed = json.loads(res.json()["choices"][0]["message"]["content"])
+                    rc = parsed.get("rootCause")
+                    evs = parsed.get("evidence", [])
+                    diags = parsed.get("diagnostics", [])
+                    eff = parsed.get("intendedEffect", {})
+                    if rc in allowed_causes and len(evs) >= 2 and diags:
+                        return {
+                            "rootCause": rc,
+                            "evidence": evs[:4],
+                            "diagnostics": diags[:3],
+                            "intendedEffect": eff,
+                            "modelName": model_name
+                        }
+        except Exception as e:
+            logger.warning("OpenAI/Groq call failed: %s", e)
 
-    # Find best matching root cause by word overlap
+    # 3. Deterministic Smart Heuristic Fallback
+    evidence_text_combined = " ".join([item["full"] for item in evidence_items]).lower()
+
+    # Find the best root cause from allowedRootCauses
     best_cause = allowed_causes[0] if allowed_causes else "unknown_incident"
     best_score = -1
-
     for cause in allowed_causes:
-        keywords = cause.replace("_", " ").replace("-", " ").split()
-        score = sum(1 for kw in keywords if kw.lower() in transcript_lower)
+        kw_list = re.split(r'[-_ ]+', cause.lower())
+        score = sum(1 for kw in kw_list if kw in evidence_text_combined)
         if score > best_score:
             best_score = score
             best_cause = cause
 
-    # Select 2 to 4 evidence items
-    chosen_evs = all_evidence[:min(4, max(2, len(all_evidence)))]
+    # Pick 2 to 4 evidence items that best correlate with the chosen root cause
+    cause_keywords = re.split(r'[-_ ]+', best_cause.lower())
+    scored_evidence = []
+    for item in evidence_items:
+        item_text_lower = item["full"].lower()
+        match_count = sum(1 for kw in cause_keywords if kw in item_text_lower)
+        scored_evidence.append((match_count, item["id"], item["text"]))
 
-    # Select 1 to 2 diagnostic tools
-    diag_list = []
-    chosen_tools = diagnostic_tools[:min(2, len(diagnostic_tools))]
-    for idx, t in enumerate(chosen_tools):
-        tname = t["name"]
-        assigned_ev = [chosen_evs[idx % len(chosen_evs)]]
-        diag_list.append({
-            "toolName": tname,
-            "arguments": {"service": service},
+    scored_evidence.sort(key=lambda x: x[0], reverse=True)
+    chosen_evidence_ids = [x[1] for x in scored_evidence[:max(2, min(4, len(scored_evidence)))]]
+    if len(chosen_evidence_ids) < 2:
+        chosen_evidence_ids = all_evidence_ids[:2]
+
+    # Find diagnostic tool matching the cause
+    chosen_diag_tools = []
+    for dt in diagnostic_tools:
+        dt_text = (dt["name"] + " " + dt.get("description", "")).lower()
+        if any(kw in dt_text for kw in cause_keywords):
+            chosen_diag_tools.append(dt)
+
+    if not chosen_diag_tools:
+        chosen_diag_tools = diagnostic_tools[:1]
+
+    # Build diagnostic dispatches with exact case-derived arguments
+    diag_dispatches = []
+    for idx, dt in enumerate(chosen_diag_tools[:2]):
+        dt_name = dt["name"]
+        schema = dt.get("inputSchema", {})
+        ev_text = scored_evidence[idx][2] if idx < len(scored_evidence) else evidence_text_combined
+        case_args = extract_case_arguments(schema, service, ev_text)
+        assigned_ev = [chosen_evidence_ids[idx % len(chosen_evidence_ids)]]
+
+        diag_dispatches.append({
+            "toolName": dt_name,
+            "arguments": case_args,
             "evidence": assigned_ev
         })
 
+    # Plan intended effect
+    at_scaling_limit = any(term in evidence_text_combined for term in [
+        "scaling limit", "max replica", "limit reached", "cannot scale", "max capacity", "quota exceeded"
+    ])
+
+    effect_tool_name = "scale_service"
+    if at_scaling_limit and "page_owner" in effect_tools:
+        effect_tool_name = "page_owner"
+    elif "rollback_deployment" in effect_tools and any(w in evidence_text_combined for w in ["regression", "deploy", "canary", "v2."]):
+        effect_tool_name = "rollback_deployment"
+    elif "disable_feature" in effect_tools and any(w in evidence_text_combined for w in ["flag", "toggle", "feature"]):
+        effect_tool_name = "disable_feature"
+    elif effect_tools:
+        effect_tool_name = effect_tools[0]
+
+    eff_spec = next((t for t in effect_tool_catalog if t["name"] == effect_tool_name), {})
+    eff_schema = eff_spec.get("inputSchema", {})
+    eff_args = extract_case_arguments(eff_schema, service, evidence_text_combined)
+
     return {
         "rootCause": best_cause,
-        "evidence": chosen_evs,
-        "diagnostics": diag_list,
-        "modelName": model_name
+        "evidence": chosen_evidence_ids[:4],
+        "diagnostics": diag_dispatches,
+        "intendedEffect": {
+            "toolName": effect_tool_name,
+            "arguments": eff_args
+        },
+        "modelName": os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     }
