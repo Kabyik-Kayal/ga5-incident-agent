@@ -110,9 +110,11 @@ async def plan_incident(
 
     # 1. Try Gemini API directly if GEMINI_API_KEY is present
     if gemini_key and httpx:
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-        
+        configured_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        # Map non-standard model strings (like gemini-3.8-flash) to active Google AI Studio endpoints
+        valid_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.5-flash"]
+        api_model = configured_model if configured_model in valid_models else "gemini-2.0-flash"
+
         system_instruction = f"""You are an incident response expert.
 Incident Title: {title}
 Service: {service}
@@ -141,28 +143,32 @@ RULES:
                 "responseMimeType": "application/json"
             }
         }
-        try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                res = await client.post(url, json=payload)
-                if res.status_code == 200:
-                    result = res.json()
-                    text_content = result["candidates"][0]["content"]["parts"][0]["text"]
-                    parsed = json.loads(text_content)
-                    rc = parsed.get("rootCause")
-                    evs = parsed.get("evidence", [])
-                    diags = parsed.get("diagnostics", [])
-                    eff = parsed.get("intendedEffect", {})
+        for candidate_model in [api_model, "gemini-1.5-flash", "gemini-2.0-flash"]:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={gemini_key}"
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    res = await client.post(url, json=payload)
+                    if res.status_code == 200:
+                        result = res.json()
+                        text_content = result["candidates"][0]["content"]["parts"][0]["text"]
+                        parsed = json.loads(text_content)
+                        rc = parsed.get("rootCause")
+                        evs = parsed.get("evidence", [])
+                        diags = parsed.get("diagnostics", [])
+                        eff = parsed.get("intendedEffect", {})
 
-                    if rc in allowed_causes and len(evs) >= 2 and diags:
-                        return {
-                            "rootCause": rc,
-                            "evidence": evs[:4],
-                            "diagnostics": diags[:3],
-                            "intendedEffect": eff,
-                            "modelName": model_name
-                        }
-        except Exception as e:
-            logger.warning("Gemini API call failed: %s", e)
+                        if rc in allowed_causes and len(evs) >= 2 and diags:
+                            return {
+                                "rootCause": rc,
+                                "evidence": evs[:4],
+                                "diagnostics": diags[:3],
+                                "intendedEffect": eff,
+                                "modelName": configured_model
+                            }
+                    else:
+                        logger.warning("Gemini model %s returned status %d: %s", candidate_model, res.status_code, res.text[:200])
+            except Exception as e:
+                logger.warning("Gemini candidate %s call failed: %s", candidate_model, e)
 
     # 2. Try OpenAI / Groq if configured
     api_key = openai_key or groq_key
