@@ -110,10 +110,11 @@ async def plan_incident(
 
     # 1. Try Gemini API directly if GEMINI_API_KEY is present
     if gemini_key and httpx:
-        configured_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-        # Map non-standard model strings (like gemini-3.8-flash) to active Google AI Studio endpoints
-        valid_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.5-flash"]
-        api_model = configured_model if configured_model in valid_models else "gemini-2.0-flash"
+        configured_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+        candidates = [configured_model]
+        for fallback in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            if fallback not in candidates:
+                candidates.append(fallback)
 
         system_instruction = f"""You are an incident response expert.
 Incident Title: {title}
@@ -143,7 +144,7 @@ RULES:
                 "responseMimeType": "application/json"
             }
         }
-        for candidate_model in [api_model, "gemini-1.5-flash", "gemini-2.0-flash"]:
+        for candidate_model in candidates:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={gemini_key}"
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
